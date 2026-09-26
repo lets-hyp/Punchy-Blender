@@ -2,6 +2,7 @@ import bpy
 import json
 import math
 import mathutils
+import os
 import re
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
@@ -12,6 +13,22 @@ from bpy_extras.io_utils import ExportHelper, ImportHelper
 class HypActionExportItem(bpy.types.PropertyGroup):
     action_name: bpy.props.StringProperty()
     export: bpy.props.BoolProperty(default=True)
+    # exportMeta.json senkronizasyonu: bu action hangi gruba ait
+    # (meta'da hiçbir grupta kayıtlı değilse "Unlisted")
+    group_name: bpy.props.StringProperty(default="Unlisted")
+
+
+def _hyp_group_select_all_update(self, context):
+    """Grup başlığındaki tek kutucuk: bu gruba ait tüm action'ların
+    export checkbox'ını toplu olarak aç/kapat."""
+    for item in context.scene.hyp_export_list:
+        if item.group_name == self.group_name:
+            item.export = self.select_all
+
+
+class HypExportGroupItem(bpy.types.PropertyGroup):
+    group_name: bpy.props.StringProperty()
+    select_all: bpy.props.BoolProperty(default=False, update=_hyp_group_select_all_update)
 
 
 # ==========================================
@@ -34,6 +51,62 @@ def clean_keyframes(key_dict, tolerance=0.001):
             last_kept_time = times[i]
     cleaned[str(times[-1])] = key_dict[str(times[-1])]
     return cleaned
+
+
+def _rdp_reduce(times, values, epsilon):
+    """Ramer-Douglas-Peucker: bir segmentin iki uc noktasini birlestiren
+    dogru parcasindan epsilon'dan fazla sapan en uzak ara noktayi bulur;
+    bulursa segmenti o noktadan ikiye bolup rekursif devam eder, yoksa
+    sadece iki uc noktayi birakir. times/values ayni sirada eslesen,
+    zaten zaman siralamasina gore sirali listelerdir."""
+    if len(times) < 3:
+        return list(times), list(values)
+
+    t0, t1 = times[0], times[-1]
+    v0, v1 = values[0], values[-1]
+    dt = t1 - t0
+
+    max_dist = -1.0
+    max_idx = 0
+    for i in range(1, len(times) - 1):
+        if dt == 0:
+            interp = v0
+        else:
+            frac = (times[i] - t0) / dt
+            interp = [v0[j] + frac * (v1[j] - v0[j]) for j in range(len(v0))]
+        # O andaki gercek deger ile "duz cizgi" varsayiminin tahmin ettigi
+        # deger arasindaki toplam sapma (eksenler toplanarak, clean_keyframes
+        # ile ayni olcum mantigi kullanilir).
+        dist = sum(abs(values[i][j] - interp[j]) for j in range(len(v0)))
+        if dist > max_dist:
+            max_dist = dist
+            max_idx = i
+
+    if max_dist > epsilon:
+        left_t, left_v = _rdp_reduce(times[:max_idx + 1], values[:max_idx + 1], epsilon)
+        right_t, right_v = _rdp_reduce(times[max_idx:], values[max_idx:], epsilon)
+        # max_idx noktasi hem sol hem sag parcada var; sol parcanin sonunu
+        # atarak cift eklenmesini onluyoruz.
+        return left_t[:-1] + right_t, left_v[:-1] + right_v
+
+    return [times[0], times[-1]], [values[0], values[-1]]
+
+
+def simplify_keyframes(key_dict, epsilon=0.05):
+    """clean_keyframes'ten SONRA calisir. clean_keyframes zaten tamamen
+    sabit/duz bolgeleri temizliyor; bu fonksiyon ise onun temizleyemedigi
+    yumusak/egrisel hareket eden bolgelerdeki gereksiz ara key'leri RDP
+    toleransina (epsilon) gore sadelestirir. Ilk ve son key HER ZAMAN
+    korunur, animasyonun baslangic/bitis pozu asla degismez."""
+    if not key_dict or len(key_dict) <= 2:
+        return key_dict
+
+    times = sorted(float(k) for k in key_dict.keys())
+    values = [key_dict[str(t)] for t in times]
+
+    reduced_times, reduced_values = _rdp_reduce(times, values, epsilon)
+
+    return {str(t): v for t, v in zip(reduced_times, reduced_values)}
 
 
 def _quat_to_xyz_euler_deg(q: mathutils.Quaternion):
@@ -80,6 +153,7 @@ _TIMELINE_CHANNELS = (
     ("rotation_euler", 3),
     ("rotation_quaternion", 4),
     ("rotation_axis_angle", 4),
+    ("scale", 3),
 )
 
 _TIMELINE_ROTATION_MODE = {
@@ -203,8 +277,6 @@ def apply_bone_timeline_data(pb, action, curve_data, fps):
             if axis >= len(prop):
                 continue
 
-            # 1) Keyframe'leri oluştur. keyframe_insert her Blender sürümünde
-            #    gerekli slot/layer/channelbag yapısını kendisi kurar.
             keys_by_frame = {}
             for k in keys:
                 frame = _timeline_frame(k.get("t", 0.0), fps)
@@ -212,7 +284,6 @@ def apply_bone_timeline_data(pb, action, curve_data, fps):
                 pb.keyframe_insert(data_path=data_path, index=axis, frame=frame)
                 keys_by_frame[round(frame, 4)] = k
 
-            # 2) Orijinal interpolasyon ve handle bilgilerini geri yükle
             fcurve = find_action_fcurve(
                 action, _bone_data_path(pb.name, data_path), axis, get_action_slot(pb.id_data)
             )
@@ -239,11 +310,138 @@ def apply_bone_timeline_data(pb, action, curve_data, fps):
             fcurve.update()
 
 
+def _normalize_bb_channel(value, axis_count=3):
+    """Blockbench animation format fixer for (position/rotation/scale):
+      1) {"0.0417": [x,y,z], ...}  -> normal keyframe example
+      2) [x, y, z]                 -> static key without t=0
+      3) 0 / 1 like single number   -> spetialy for scale, one variable for 3 axis (etc. "scale": 0)
+    This method turned this like {t_str: [x,y,z]} """
+
+    if isinstance(value, dict):
+        for t_str, kv in value.items():
+            if isinstance(kv, dict):
+                raise ValueError(
+                    f"A Bezier/curved keyframe was detected (t={t_str}). "
+                    "This plugin only supports Step/Linear interpolation. "
+                    "Please use ‘Bake Animation’ in Blockbench to "
+                    "convert this animation to straight keyframes and export it again."
+                )
+        return value
+    
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, (int, float)):
+        return {"0.0": [value] * axis_count}
+    if isinstance(value, (list, tuple)):
+        return {"0.0": list(value)}
+    return {}
+
 def apply_bone_timeline_rotation_mode(pb, curve_data):
     for data_path, mode in _TIMELINE_ROTATION_MODE.items():
         if data_path in curve_data:
             pb.rotation_mode = mode
             return
+
+
+# ==========================================
+# 2c. EXPORT META (exportMeta.json) SENKRONİZASYON SİSTEMİ
+# ==========================================
+_HYP_EXPORT_META_FILENAME = "exportMeta.json"
+_HYP_UNLISTED_GROUP = "Unlisted"
+
+
+def _hyp_export_meta_path():
+    """.blend dosyasının yanındaki exportMeta.json yolunu döndürür.
+    Blend dosyası henüz kaydedilmemişse (göreli '//' yolu çözülemez) None döner."""
+    if not bpy.data.filepath:
+        return None
+    return bpy.path.abspath("//" + _HYP_EXPORT_META_FILENAME)
+
+
+def _hyp_load_export_meta():
+    """exportMeta.json'ı okur; yoksa varsayılan şablonla oluşturur."""
+    default = {"version": "1.0", "groups": {}}
+    path = _hyp_export_meta_path()
+    if not path:
+        return default
+    if not os.path.isfile(path):
+        _hyp_save_export_meta(default)
+        return default
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        data = default
+    data.setdefault("version", "1.0")
+    data.setdefault("groups", {})
+    return data
+
+
+def _hyp_save_export_meta(data):
+    """exportMeta.json'ı diske yazar. Blend dosyası kaydedilmemişse sessizce atlar."""
+    path = _hyp_export_meta_path()
+    if not path:
+        return
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+
+def _hyp_sync_export_meta():
+    """Sahnedeki action'lar ile meta dosyasını senkronize eder:
+    - Meta'da kayıtlı ama sahnede artık olmayan action'ları meta'dan temizler.
+    - Boş kalan grupları siler.
+    Dönüş: (meta_dict, action_name -> group_name eşleme sözlüğü)"""
+    meta = _hyp_load_export_meta()
+    groups = meta.setdefault("groups", {})
+
+    existing_action_names = {a.name for a in bpy.data.actions}
+    changed = False
+    for g_name in list(groups.keys()):
+        cleaned = [n for n in groups[g_name] if n in existing_action_names]
+        if len(cleaned) != len(groups[g_name]):
+            changed = True
+        if cleaned:
+            groups[g_name] = cleaned
+        else:
+            del groups[g_name]
+            changed = True
+
+    if changed:
+        _hyp_save_export_meta(meta)
+
+    action_to_group = {}
+    for g_name, action_names in groups.items():
+        for a_name in action_names:
+            action_to_group[a_name] = g_name
+
+    return meta, action_to_group
+
+
+def _hyp_move_action_to_group(groups, action_name, target_group):
+    """Bir action'ı, kayıtlı olduğu her gruptan çıkarıp hedef gruba taşır.
+    Kaynak grup taşıma sonrası boş kalırsa meta'dan tamamen silinir."""
+    for g_name in list(groups.keys()):
+        if g_name == target_group:
+            continue
+        if action_name in groups[g_name]:
+            groups[g_name].remove(action_name)
+            if not groups[g_name]:
+                del groups[g_name]
+
+    groups.setdefault(target_group, [])
+    if action_name not in groups[target_group]:
+        groups[target_group].append(action_name)
+
+
+def _hyp_group_name_from_filepath(filepath):
+    """Export edilen dosyanın adından (uzantısız) otomatik grup adı türetir.
+    Örn: '.../sword.animation.json' -> 'sword.animation'
+    Windows/Unix ayraçlarının ikisini de (os.path'in hangi platformda
+    çalıştığından bağımsız olarak) doğru şekilde işler."""
+    normalized = (filepath or "").replace("\\", "/").rstrip("/")
+    base = normalized.rsplit("/", 1)[-1]
+    name, _ext = os.path.splitext(base)
+    return name.strip()
 
 
 # ==========================================
@@ -264,27 +462,98 @@ class HYP_OT_export_animations(bpy.types.Operator, ExportHelper):
         default=False,
     )
 
+    optimize_export: bpy.props.BoolProperty(
+        name="Optimized Export (Simplify Curves)",
+        description=(
+            "clean_keyframes removes only completely static/flat sections. When this option is "
+            "enabled, unnecessary intermediate keys in areas with smooth/curved motion "
+            "generated by the RDP algorithm are also simplified within the tolerance limit. "
+            "Start and end keys are always preserved. When disabled, the export "
+            "behavior remains exactly the same as before."
+        ),
+        default=False,
+    )
+    optimize_tolerance: bpy.props.FloatProperty(
+        name="Simplify Tolerance",
+        description=(
+            "RDP smoothing tolerance. The higher it is, the less detail remains. "
+            "(The file size decreases) but the risk of deviation from the curve also increases. It is recommended to "
+            "start with low values and increase them while testing the output."
+        ),
+        default=0.05,
+        min=0.0001,
+        max=5.0,
+        precision=4,
+    )
+
     def invoke(self, context, event):
+        meta, action_to_group = _hyp_sync_export_meta()
+
+        if not bpy.data.filepath:
+            self.report({'WARNING'}, "This blend fie doesn't saved: exportMeta.json does not created.")
+
         context.scene.hyp_export_list.clear()
+        context.scene.hyp_export_groups.clear()
+
+        # Grup sırası: meta'daki gruplar (alfabetik) + en sonda sanal "Unlisted"
+        group_names_ordered = sorted(meta.get("groups", {}).keys())
+        has_unlisted = any(
+            action.name not in action_to_group for action in bpy.data.actions
+        )
+        if has_unlisted:
+            group_names_ordered.append(_HYP_UNLISTED_GROUP)
+
         for action in bpy.data.actions:
             item = context.scene.hyp_export_list.add()
             item.action_name = action.name
+            item.group_name = action_to_group.get(action.name, _HYP_UNLISTED_GROUP)
             item.export = False
             if (context.active_object
                     and context.active_object.animation_data
                     and context.active_object.animation_data.action == action):
                 item.export = True
+
+        for g_name in group_names_ordered:
+            g_item = context.scene.hyp_export_groups.add()
+            g_item.group_name = g_name
+            g_item.select_all = False
+
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "export_metadata_timeline")
+        layout.separator()
 
+        opt_box = layout.box()
+        opt_box.prop(self, "optimize_export")
+        if self.optimize_export:
+            opt_box.prop(self, "optimize_tolerance")
+        layout.separator()
+
+        meta_box = layout.box()
+        meta_box.label(text="Export Meta - Point Group", icon='FILE_FOLDER')
+        preview_group = _hyp_group_name_from_filepath(self.filepath)
+        if preview_group:
+            meta_box.label(text="File name based group: \"%s\"" % preview_group, icon='GROUP')
+        else:
+            meta_box.label(text="When file name selected, group automatically created.", icon='INFO')
+
+        layout.separator()
         box = layout.box()
         box.label(text="Select Actions to Export:", icon='ACTION')
-        for item in context.scene.hyp_export_list:
-            box.prop(item, "export", text=item.action_name)
+
+        for g_item in context.scene.hyp_export_groups:
+            g_box = box.box()
+            header = g_box.row(align=True)
+            header.prop(g_item, "select_all", text="")
+            icon = 'GHOST_ENABLED' if g_item.group_name == _HYP_UNLISTED_GROUP else 'GROUP'
+            header.label(text=g_item.group_name, icon=icon)
+
+            for item in context.scene.hyp_export_list:
+                if item.group_name == g_item.group_name:
+                    g_box.prop(item, "export", text=item.action_name)
 
     def execute(self, context):
         rig = context.active_object
@@ -297,10 +566,11 @@ class HYP_OT_export_animations(bpy.types.Operator, ExportHelper):
         
         export_dict = {"format_version": "1.8.0", "animations": {}}
         original_action = rig.animation_data.action if rig.animation_data else None
+        exported_action_names = []
 
         current_frame = context.scene.frame_current
 
-        # Rest-pose (bind) matrisleri karadan kareye değişmez; tüm export boyunca bir kez hesaplanır
+        
         pose_bones = list(rig.pose.bones)
         rest_local_inv = {}
         for pb in pose_bones:
@@ -333,9 +603,10 @@ class HYP_OT_export_animations(bpy.types.Operator, ExportHelper):
                 
             for m in context.scene.timeline_markers:
                 if start_f <= m.frame <= end_f:
-                    # Pose marker'da zaten aynı karede aynı isimde marker varsa çakışmayı önle
                     if not any(pm.frame == m.frame and pm.name == m.name for pm in action.pose_markers):
                         all_markers.append(m)
+
+            all_markers.sort(key=lambda mk: mk.frame)
 
             for m in all_markers:
                 t_sec = round((m.frame - start_f) / fps, 4)
@@ -343,29 +614,30 @@ class HYP_OT_export_animations(bpy.types.Operator, ExportHelper):
                 t_str = str(t_sec)
                 
                 m_name = m.name
-                
-                # Loop değerini çek (Tırnaklı veya tırnaksız)
-                lm = re.search(r'L:\s*(?:"([^"]+)"|(\S+))', m_name, re.IGNORECASE)
-                if lm: 
+
+                # L:/S:/T:
+                remaining = m_name
+
+                lm = re.match(r'\s*L:\s*(?:"([^"]+)"|(\S+))\s*', remaining, re.IGNORECASE)
+                if lm:
                     loop_mode = lm.group(1) or lm.group(2)
-                
-                # Sound değerini çek (Tırnaklı veya tırnaksız)
-                sm = re.search(r'S:\s*(?:"([^"]+)"|(\S+))', m_name, re.IGNORECASE)
-                if sm: 
+                    remaining = remaining[lm.end():]
+
+                sm = re.match(r'\s*S:\s*(?:"([^"]+)"|(\S+))\s*', remaining, re.IGNORECASE)
+                if sm:
                     s_effect = sm.group(1) or sm.group(2)
                     sound_effects[t_str] = {"effect": s_effect}
-                    
-                # Timeline değerini belirteçle çekildiyse (Timeline:"...") al
-                tm = re.search(r'T:\s*(?:"([^"]+)"|(\S+))', m_name, re.IGNORECASE)
-                explicit_tl = tm.group(1) or tm.group(2) if tm else ""
-                
-                # Geriye kalan ve hiçbir ön eki olmayan metni (Implicit Timeline) bul
-                rest = m_name
-                rest = re.sub(r'L:\s*(?:"[^"]+"|\S+)', '', rest, flags=re.IGNORECASE)
-                rest = re.sub(r'S:\s*(?:"[^"]+"|\S+)', '', rest, flags=re.IGNORECASE)
-                rest = re.sub(r'T:\s*(?:"[^"]+"|\S+)', '', rest, flags=re.IGNORECASE)
-                
-                implicit_tl = rest.strip()
+                    remaining = remaining[sm.end():]
+
+                tm = re.match(r'\s*T:\s*(?:"([^"]+)"|(\S+))\s*', remaining, re.IGNORECASE)
+                if tm:
+                    explicit_tl = tm.group(1) or tm.group(2)
+                    remaining = remaining[tm.end():]
+                else:
+                    explicit_tl = ""
+
+                # (Implicit Timeline)
+                implicit_tl = remaining.strip()
                 
                 final_tl = explicit_tl
                 if implicit_tl:
@@ -386,7 +658,7 @@ class HYP_OT_export_animations(bpy.types.Operator, ExportHelper):
             prev_eulers = {}
 
             for pb in pose_bones:
-                bones_data[pb.name] = {"rotation": {}, "position": {}}
+                bones_data[pb.name] = {"rotation": {}, "position": {}, "scale": {}}
 
             for frame in range(start_f, end_f + 1):
                 context.scene.frame_set(frame)
@@ -400,25 +672,22 @@ class HYP_OT_export_animations(bpy.types.Operator, ExportHelper):
 
                     offset_mat = rest_local_inv[pb.name] @ local_matrix
 
-                    loc_bl, rot_quat_bl, _ = offset_mat.decompose()
-                    clean_offset_mat = mathutils.Matrix.LocRotScale(loc_bl, rot_quat_bl, None)
+                    loc_bl, rot_quat_bl, scale_bl = offset_mat.decompose()
+                    clean_offset_mat = mathutils.Matrix.LocRotScale(loc_bl, rot_quat_bl, scale_bl)
+                     
                     
-                    if pb.name == "itemgrip_right":
-                        temp_euler = clean_offset_mat.to_euler('XYZ')
-                        inverted_euler = mathutils.Euler((-temp_euler.x, -temp_euler.y, -temp_euler.z), 'XYZ')
-                        final_mat = inverted_euler.to_matrix().to_4x4()
-                        
+                    if pb.name == "itemgrip_right" or pb.name == "itemgrip_left":
+                        #print(frame, pb.name, "Loc:", loc_bl.x, loc_bl.y, loc_bl.z)
                         if pb.name in prev_eulers:
-                            euler_bl = final_mat.to_euler('XYZ', prev_eulers[pb.name])
+                            euler_bl = clean_offset_mat.to_euler('YZX', prev_eulers[pb.name])
                         else:
-                            euler_bl = final_mat.to_euler('XYZ')
-                            
+                            euler_bl = clean_offset_mat.to_euler('YZX')
+
                         prev_eulers[pb.name] = euler_bl.copy()
-                        
-                        rx = round(math.degrees(euler_bl.x), 2)
-                        ry = round(math.degrees(euler_bl.y - euler_bl.z), 2)
-                        rz = round(math.degrees(euler_bl.z - euler_bl.y), 2)
-                        
+
+                        rx = round(math.degrees(euler_bl.x * -1.0), 5)
+                        ry = round(math.degrees(euler_bl.y * -1.0), 5)
+                        rz = round(math.degrees(euler_bl.z * -1.0), 5)
                     else:
                         if pb.name in prev_eulers:
                             euler_bl = clean_offset_mat.to_euler('XYZ', prev_eulers[pb.name])
@@ -437,7 +706,7 @@ class HYP_OT_export_animations(bpy.types.Operator, ExportHelper):
                     
                     bones_data[pb.name]["rotation"][b_t_str] = [rx, ry, rz]
                     
-                    if pb.name == "itemgrip_right":
+                    if pb.name == "itemgrip_right" or pb.name == "itemgrip_left":
                         px = round(loc_bl.x * -16.0, 3)
                         py = round(loc_bl.y * 16.0, 3)
                         pz = round(loc_bl.z * 16.0, 3)
@@ -452,18 +721,42 @@ class HYP_OT_export_animations(bpy.types.Operator, ExportHelper):
 
                     bones_data[pb.name]["position"][b_t_str] = [px, py, pz]
 
+                    if pb.name == "itemgrip_right" or pb.name == "itemgrip_left":
+                        sx = round(scale_bl.x, 5)
+                        sy = round(scale_bl.y, 5)
+                        sz = round(scale_bl.z, 5)
+                    else:
+                        sx = round(scale_bl.x, 5)
+                        sy = round(scale_bl.z, 5)
+                        sz = round(scale_bl.y, 5)
+
+                    sx = 0.0 if sx == 0.0 else sx
+                    sy = 0.0 if sy == 0.0 else sy
+                    sz = 0.0 if sz == 0.0 else sz
+
+                    bones_data[pb.name]["scale"][b_t_str] = [sx, sy, sz]
+
             for b_name in list(bones_data.keys()):
                 pos_dict = clean_keyframes(bones_data[b_name]["position"])
                 rot_dict = clean_keyframes(bones_data[b_name]["rotation"])
-                
+                scale_dict = clean_keyframes(bones_data[b_name]["scale"])
+
+                if self.optimize_export:
+                    pos_dict = simplify_keyframes(pos_dict, self.optimize_tolerance)
+                    rot_dict = simplify_keyframes(rot_dict, self.optimize_tolerance)
+                    scale_dict = simplify_keyframes(scale_dict, self.optimize_tolerance)
+
                 pos_total_movement = sum(sum(abs(v) for v in val) for val in pos_dict.values())
                 rot_total_movement = sum(sum(abs(v) for v in val) for val in rot_dict.values())
+                # Scale için referans 1.0'dır (identity); 1.0'dan sapma "hareket" sayılır
+                scale_total_deviation = sum(sum(abs(v - 1.0) for v in val) for val in scale_dict.values())
                 
-                if pos_total_movement < 0.001 and rot_total_movement < 0.001:
+                if pos_total_movement < 0.001 and rot_total_movement < 0.001 and scale_total_deviation < 0.001:
                     del bones_data[b_name]
                 else:
                     bones_data[b_name]["position"] = pos_dict
                     bones_data[b_name]["rotation"] = rot_dict
+                    bones_data[b_name]["scale"] = scale_dict
 
             # --- METADATA TIMELINE (RAW, NON-BAKED) ---
             metadata_timeline = {}
@@ -494,6 +787,7 @@ class HYP_OT_export_animations(bpy.types.Operator, ExportHelper):
                 action_export_data["hyp_metadata"]["action_timeline"] = metadata_timeline
 
             export_dict["animations"][action.name] = action_export_data
+            exported_action_names.append(action.name)
 
         if original_action: rig.animation_data.action = original_action
         
@@ -509,7 +803,19 @@ class HYP_OT_export_animations(bpy.types.Operator, ExportHelper):
 
         with open(self.filepath, 'w', encoding='utf-8') as f:
             f.write(compact_json_str)
-            
+
+        # --- EXPORT META GÜNCELLEME (grup taşıma / migration) ---
+        # Grup adı, kullanıcının verdiği çıktı dosya adından otomatik türetilir
+        # (örn. "sword.animation.json" -> grup: "sword.animation").
+        target_group = _hyp_group_name_from_filepath(self.filepath)
+        if target_group and exported_action_names:
+            meta = _hyp_load_export_meta()
+            groups = meta.setdefault("groups", {})
+            for a_name in exported_action_names:
+                _hyp_move_action_to_group(groups, a_name, target_group)
+            meta["groups"] = groups
+            _hyp_save_export_meta(meta)
+
         self.report({'INFO'}, "Punchy JSON Exported Successfully!")
         return {'FINISHED'}
 
@@ -524,7 +830,7 @@ class HYP_OT_import_animations(bpy.types.Operator, ImportHelper):
         rig = context.active_object
 
         if not rig or rig.type != 'ARMATURE':
-            self.report({'ERROR'}, "Lütfen bir Armature (Rig) seçin!")
+            self.report({'ERROR'}, "Please select a Armature (Rig)!")
             return {'CANCELLED'}
 
         with open(self.filepath, 'r', encoding='utf-8') as f:
@@ -567,7 +873,6 @@ class HYP_OT_import_animations(bpy.types.Operator, ImportHelper):
                 if frame not in markers_by_frame:
                     markers_by_frame[frame] = []
                 
-                # Veriyi noktalı virgülden bölerek listeye ekle
                 if isinstance(t_data, list):
                     flags = t_data
                 else:
@@ -575,32 +880,37 @@ class HYP_OT_import_animations(bpy.types.Operator, ImportHelper):
                     
                 markers_by_frame[frame].extend(flags)
 
-            # Karakter Limitini (40/60) Yöneterek Markerları Oluştur (Frame Kaydırma)
+            # Character limit (40/60) marker creator (Frame Floating)
             for frame, parts in markers_by_frame.items():
+                chunks = []
                 current_str = ""
-                current_frame = frame  # Başlangıç karesi
-                
                 for part in parts:
-                    # Loop veya Sound değilse timeline flag'idir, sonuna noktalı virgül koy
                     is_timeline = not (part.startswith("L:") or part.startswith("S:"))
                     part_str = part + ";" if is_timeline else part + " "
-                    
-                    # İçerikte Loop veya Sound varsa limit 40, sadece timeline ise limit 60
+
                     limit = 40 if ("L:" in current_str or "S:" in current_str) else 60
-                    
-                    # Eğer bu parçayı eklemek limiti aşıyorsa, mevcut stringi marker yap ve sonraki kareye geç
+
                     if len(current_str) + len(part_str) > limit and current_str:
-                        m = action.pose_markers.new(name=current_str.strip())
-                        m.frame = current_frame
+                        chunks.append(current_str)
                         current_str = ""
-                        current_frame += 1  # Limiti aştığı için bir sonraki kareye kaydır!
-                        
+
                     current_str += part_str
-                    
-                # Kalan metni son marker olarak ekle
+
                 if current_str:
-                    m = action.pose_markers.new(name=current_str.strip())
-                    m.frame = current_frame
+                    chunks.append(current_str)
+
+                if frame == 0 and len(chunks) > 1:
+                    n = len(chunks)
+                    for i, chunk in enumerate(chunks):
+                        offset = -(n - 1 - i)
+                        m = action.pose_markers.new(name=chunk.strip())
+                        m.frame = offset
+                else:
+                    current_frame = frame
+                    for chunk in chunks:
+                        m = action.pose_markers.new(name=chunk.strip())
+                        m.frame = current_frame
+                        current_frame += 1
 
             # --- BONES IMPORT ---
             bones_data = anim_data.get("bones", {})
@@ -611,7 +921,6 @@ class HYP_OT_import_animations(bpy.types.Operator, ImportHelper):
                 pb = rig.pose.bones.get(b_name)
                 if not pb: continue
 
-                # MetaData içinde bake edilmemiş timeline verisi varsa, onu öncelikli kullan
                 bone_curve_data = metadata_timeline.get(b_name)
                 if bone_curve_data:
                     apply_bone_timeline_rotation_mode(pb, bone_curve_data)
@@ -621,42 +930,56 @@ class HYP_OT_import_animations(bpy.types.Operator, ImportHelper):
                     continue
 
                 pb.rotation_mode = 'XYZ'
+                
+                try:
+                    for t_str, pos in _normalize_bb_channel(b_data.get("position", {})).items():
+                        frame = int(round(float(t_str) * fps))
 
-                # Pozisyon Aktarımı
-                for t_str, pos in b_data.get("position", {}).items():
-                    frame = int(round(float(t_str) * fps))
+                        if pb.name == "itemgrip_right" or pb.name == "itemgrip_left":
+                            pb.location = (
+                                pos[0] / -16.0,
+                                pos[1] /  16.0,
+                                pos[2] /  16.0,
+                            )
+                        else:
+                            pb.location = (
+                                pos[0] / -16.0,
+                                pos[2] /  16.0,
+                                pos[1] / -16.0,
+                            )
+                        pb.keyframe_insert(data_path="location", frame=frame)
+
                     
-                    if pb.name == "itemgrip_right":
-                        pb.location = (
-                            pos[0] / -16.0,
-                            pos[1] /  16.0,
-                            pos[2] /  16.0,
-                        )
-                    else:
-                        pb.location = (
-                            pos[0] / -16.0,
-                            pos[2] /  16.0,
-                            pos[1] / -16.0,
-                        )
-                    pb.keyframe_insert(data_path="location", frame=frame)
+                    for t_str, rot in _normalize_bb_channel(b_data.get("rotation", {})).items():
+                        frame = int(round(float(t_str) * fps))
+
+                        if pb.name == "itemgrip_right" or pb.name == "itemgrip_left":
+                            pb.rotation_euler = [
+                                math.radians(rot[0] * -1.0),
+                                math.radians(rot[2]),
+                                math.radians(rot[1]),
+                            ]
+                        else:
+                            pb.rotation_euler = [
+                                math.radians(rot[0] * -1.0),
+                                math.radians(rot[2] *  1.0),
+                                math.radians(rot[1] *  1.0),
+                            ]
+                        pb.keyframe_insert(data_path="rotation_euler", frame=frame)
+
                     
-                # Rotasyon Aktarımı
-                for t_str, rot in b_data.get("rotation", {}).items():
-                    frame = int(round(float(t_str) * fps))
-                    
-                    if pb.name == "itemgrip_right":
-                        pb.rotation_euler = [
-                            math.radians(rot[0]),
-                            math.radians(rot[1]),
-                            math.radians(rot[2]),
-                        ]
-                    else:
-                        pb.rotation_euler = [
-                            math.radians(rot[0] * -1.0),
-                            math.radians(rot[2] *  1.0),
-                            math.radians(rot[1] *  1.0),
-                        ]
-                    pb.keyframe_insert(data_path="rotation_euler", frame=frame)
+                    for t_str, scl in _normalize_bb_channel(b_data.get("scale", {})).items():
+                        frame = int(round(float(t_str) * fps))
+
+                        if pb.name == "itemgrip_right" or pb.name == "itemgrip_left":
+                            pb.scale = (scl[0], scl[1], scl[2])
+                        else:
+                            pb.scale = (scl[0], scl[2], scl[1])
+                        pb.keyframe_insert(data_path="scale", frame=frame)
+                        
+                except ValueError as e:
+                    self.report({'ERROR'}, str(e))
+                    return {'CANCELLED'}
 
             for fcurve in iter_action_fcurves(action, get_action_slot(rig)):
                 # MetaData timeline'dan geri yüklenen orijinal interpolasyonları bozma
@@ -702,6 +1025,7 @@ class VIEW3D_PT_hyp_anim_panel(bpy.types.Panel):
 # ==========================================
 classes = (
     HypActionExportItem,
+    HypExportGroupItem,
     HYP_OT_export_animations,
     HYP_OT_import_animations,
     VIEW3D_PT_hyp_anim_panel,
@@ -711,11 +1035,13 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.hyp_export_list = bpy.props.CollectionProperty(type=HypActionExportItem)
+    bpy.types.Scene.hyp_export_groups = bpy.props.CollectionProperty(type=HypExportGroupItem)
 
 def unregister():
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
     del bpy.types.Scene.hyp_export_list
+    del bpy.types.Scene.hyp_export_groups
 
 if __name__ == "__main__":
     register()
