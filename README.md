@@ -116,13 +116,13 @@ please report them to the developer:
 
 \* Punchy Wiki:
 
-&#x20; https://github.com/punchy-guys/punchy-wiki/wiki\[cite: 5]
+&#x20; https://github.com/punchy-guys/punchy-wiki/wiki
 
 
 
 \* Punchy Blender Wiki \& Issues:
 
-&#x20; https://github.com/Hamza-inc/Punchy-Blender/wiki\[cite: 5]
+&#x20; https://github.com/lets-hyp/Punchy-Blender
 
 &#x20; 
 
